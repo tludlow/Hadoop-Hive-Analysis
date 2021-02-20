@@ -1,6 +1,19 @@
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.SortedMap;
 import java.util.StringTokenizer;
+import java.util.TreeMap;
+import java.util.Map.Entry;
+import java.util.stream.Collectors;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
@@ -24,7 +37,7 @@ public class TopKNetProfitDriver {
     // Mapper
     public static class NetProfitMapper extends Mapper<Object, Text, Text, DoubleWritable> {
         // Sales lines
-        private Text word = new Text();
+        private Text saleLine = new Text();
 
         public void map(Object key, Text value, Context context) throws IOException, InterruptedException {
             Configuration conf = context.getConfiguration();
@@ -36,7 +49,7 @@ public class TopKNetProfitDriver {
 
             StringTokenizer itr = new StringTokenizer(value.toString());
             while (itr.hasMoreTokens()) {
-                word.set(itr.nextToken());
+                saleLine.set(itr.nextToken());
 
                 try {
                     // Only emit if it's within the date range provided
@@ -47,19 +60,15 @@ public class TopKNetProfitDriver {
 
                     // Get the date of the sale
                     Date saleDate = new Date(Long.parseLong(splitRecord[0]) * 1000);
-                    System.out.println(saleDate.toString());
-                    System.out.println("-------");
-                    if (saleDate.after(startDate) && saleDate.before(endDate)) {
-                        System.out
-                                .println("Is within range! store: " + splitRecord[7] + "   profit: " + splitRecord[22]);
+                    if (saleDate.after(startDate) && saleDate.before(endDate) && !splitRecord[7].equals("")) {
                         context.write(new Text(splitRecord[7]),
                                 new DoubleWritable(Double.parseDouble(splitRecord[22])));
                     }
                 } catch (NumberFormatException nfe) {
-                    System.err.println(value + " nfe");
+                    // System.err.println(value + " nfe");
                     continue;
                 } catch (ArrayIndexOutOfBoundsException aiobe) {
-                    System.err.println(value + "   array");
+                    // System.err.println(value + " array");
                 }
             }
         }
@@ -80,6 +89,85 @@ public class TopKNetProfitDriver {
         }
     }
 
+    /**
+     * Second round
+     */
+
+    public static class NetProfitMapperTopK extends Mapper<Object, Text, Text, DoubleWritable> {
+        // store and profit lines
+        private Text storeProfit = new Text();
+
+        HashMap<String, Double> localTop = new HashMap<String, Double>();
+        Map<String, Double> sortedLocalTop;
+
+        public void map(Object key, Text value, Context context) throws IOException, InterruptedException {
+            Configuration conf = context.getConfiguration();
+            int numStores = Integer.parseInt(conf.get("num_stores"));
+
+            StringTokenizer itr = new StringTokenizer(value.toString());
+            while (itr.hasMoreTokens()) {
+                storeProfit.set(itr.nextToken());
+
+                String[] splitCompanyProfitLine = value.toString().split("\\s+");
+                // System.out.println(splitCompanyProfitLine[0] + " --- " +
+                // splitCompanyProfitLine[1]);
+
+                localTop.put(splitCompanyProfitLine[0], Double.parseDouble(splitCompanyProfitLine[1]));
+                if (localTop.size() > numStores) {
+                    sortedLocalTop = localTop.entrySet().stream()
+                            .sorted(Comparator.comparing(Entry::getValue, Comparator.reverseOrder())).limit(numStores)
+                            .collect(Collectors.toMap(Entry::getKey, Entry::getValue, (e1, e2) -> e1,
+                                    LinkedHashMap::new));
+                }
+            }
+        }
+
+        protected void cleanup(Context context) throws IOException, InterruptedException {
+            Configuration conf = context.getConfiguration();
+            int numStores = Integer.parseInt(conf.get("num_stores"));
+
+            if (localTop.size() < numStores) {
+                sortedLocalTop = localTop.entrySet().stream()
+                        .sorted(Comparator.comparing(Entry::getValue, Comparator.reverseOrder())).limit(numStores)
+                        .collect(Collectors.toMap(Entry::getKey, Entry::getValue, (e1, e2) -> e1, LinkedHashMap::new));
+            }
+            for (Map.Entry<String, Double> companyProfit : sortedLocalTop.entrySet()) {
+                context.write(new Text(companyProfit.getKey()), new DoubleWritable(companyProfit.getValue()));
+            }
+
+        }
+    }
+
+    // Reducer / combiner
+    public static class NetProfitReducerTopK extends Reducer<Text, DoubleWritable, Text, DoubleWritable> {
+        HashMap<String, Double> companyProfits = new HashMap<String, Double>();
+
+        public void reduce(Text key, Iterable<DoubleWritable> values, Context context)
+                throws IOException, InterruptedException {
+            List<DoubleWritable> combinedProfit = new ArrayList<DoubleWritable>();
+            for (DoubleWritable val : values) {
+                combinedProfit.add(val);
+            }
+
+            companyProfits.put(key.toString(), combinedProfit.get(0).get());
+        }
+
+        protected void cleanup(Context context) throws IOException, InterruptedException {
+            Configuration conf = context.getConfiguration();
+            int numStores = Integer.parseInt(conf.get("num_stores"));
+
+            Map<String, Double> sortedCompanyProfits = companyProfits.entrySet().stream()
+                    .sorted(Comparator.comparing(Entry::getValue, Comparator.reverseOrder())).limit(numStores)
+                    .collect(Collectors.toMap(Entry::getKey, Entry::getValue, (e1, e2) -> e1, LinkedHashMap::new));
+
+            // This was limited previously to the max provided by the argument so we can
+            // just do the whole thing and not worry about output size
+            for (Map.Entry<String, Double> companyProfit : sortedCompanyProfits.entrySet()) {
+                context.write(new Text(companyProfit.getKey()), new DoubleWritable(companyProfit.getValue()));
+            }
+        }
+    }
+
     // Driver
     public static void main(String[] args) throws Exception {
         Configuration conf = new Configuration();
@@ -95,7 +183,19 @@ public class TopKNetProfitDriver {
         job.setOutputKeyClass(Text.class);
         job.setOutputValueClass(DoubleWritable.class);
         FileInputFormat.addInputPath(job, new Path(args[3]));
-        FileOutputFormat.setOutputPath(job, new Path(args[4]));
-        System.exit(job.waitForCompletion(true) ? 0 : 1);
+        FileOutputFormat.setOutputPath(job, new Path("output/topknetprofittemp"));
+        job.waitForCompletion(true);
+
+        Job job2 = Job.getInstance(conf, "top k net profit second cycle");
+        job2.setJarByClass(TopKNetProfitDriver.class);
+        job2.setMapperClass(NetProfitMapperTopK.class);
+        // job2.setCombinerClass(NetProfitReducerTopK.class);
+        job2.setReducerClass(NetProfitReducerTopK.class);
+        job2.setNumReduceTasks(1);
+        job2.setOutputKeyClass(Text.class);
+        job2.setOutputValueClass(DoubleWritable.class);
+        FileInputFormat.addInputPath(job2, new Path("output/topknetprofittemp"));
+        FileOutputFormat.setOutputPath(job2, new Path(args[4]));
+        System.exit(job2.waitForCompletion(true) ? 0 : 1);
     }
 }
